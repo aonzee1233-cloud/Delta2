@@ -1,0 +1,2265 @@
+--[[
+  autofish_v6.lua - auto fishing for the Roblox game "Fisch"
+
+  Runtime : Roblox client, Luau, through an executor (written for Delta, phone or PC)
+  Run     : stand at the water's edge with your rod equipped (or in the hotbar), paste this
+            whole file into Delta and press Execute. A small panel shows up: drag the title bar
+            to move it, tap "-" to shrink it to a pill. Executing again replaces the old copy.
+
+  How it plays: no remotes, only inputs a player has - hold to cast, press the shake button,
+            hold / release to keep the white bar under the fish.
+
+  v6-9 : from the v6-8 report: (1) hold method "mouse2" is gone from HOLD_ORDER and the hold chooser needs
+         more evidence before it switches: both fish that got away at 41-42% came right after a mid-reel
+         "switching to mouse2"; (2) ping is sampled every 2s: the report gets a "ping now / avg / max" line and
+         the "diag" and "nothing after 20s" log lines show the ping at that moment.
+  v6-8 : from the v6-7 report: (1) a bobber that stays after a catch is re-equipped away at once instead of
+         losing 20-50s to casts that do nothing; (2) COOLDOWN is 4.0-5.5s, because casts within ~3s of a catch
+         failed about half the time and casts after 4s+ did not; (3) the cast check with the bobber off waits
+         8s, not 20s. The re-equip after a failed cast (v6-6b) stays: it fixed 7 of 9 failures.
+  v6-7 : the report title and the start log line now say v6-7, so you can tell which copy ran. A failed
+         cast also logs "diag new text": any text on screen that was not there at the last good cast.
+  v6-6b: a failed cast now re-equips the rod (twice) before the input method gets blamed and rotated, and logs
+         one "diag" line (rod equipped, bobber, humanoid state, distance from home, Roblox menu open, chat box
+         focused, click spot blocked, new GUIs since the last good cast). LOG_KEEP is 140 so it all fits in the report.
+  v6-6 : the shake press never happened ("shake presses 0"): the script looked for a child called
+         "button" but the game's is "default", so it now falls back to any visible button in the shake GUI.
+         Also fixes casts that stopped registering after "bobber stays after a catch". With the bobber
+         check off, a cast was judged on a 5s window but the bite takes 12-20s, so every working cast
+         read as "did nothing" and got recast on top of the live line. Now the window matches the bite
+         wait, a fresh bobber counts as proof, the check turns itself back on once the bobber is gone,
+         and a slow bobber cleanup gets 5s instead of 2s before the check is switched off.
+
+  v6-5 : never stops on its own. The session limit, catch target and breaks are gone, repairs
+         rest a few seconds instead of minutes, losing the panel no longer kills the script,
+         can't-walk-back now fishes from where it stands, and the bobber check heals itself
+         instead of staying off after one slow catch.
+
+  New in v6 (all of it wrapped so a bug in it cannot stop the fishing loop)
+   Copy report : panel button. Puts a text dump on the clipboard: settings, which input methods
+                 won, bite-wait and reel stats, learned bar response, the PlayerGui list, GUI
+                 trees the script saw, the last 80 log lines. Paste it into a chat and whoever
+                 helps sees exactly what the script saw.
+   GUI recorder: the first shake / reel GUI, and any new ScreenGui that appears while you play,
+                 are saved as trees for the report. That is how you find new names after a
+                 game update.
+   Calibration : the reel brain's learned bar response is kept per rod and saved (REMEMBER_CAL),
+                 so a fresh execute starts calibrated instead of relearning.
+   Notify      : optional Discord webhook (NOTIFY_URL). Pings when the watchdog repairs;
+                 NOTIFY_EVERY adds a status line every N min.
+   Lifetime    : total catches and running time are kept across executes (shown in the report).
+  Earlier: v5 target counter, walk home, watchdog. v4 reel brain, human timing, panel.
+
+  Where things are (search for the banner text)
+   local CFG = {  ........ every setting you are meant to touch
+   ---- helpers .......... log (keeps the report's log lines), random, find / getGui
+   ---- settings + session  save file: settings, panel spot, calibration, lifetime
+   ---- panel ............ buildPanel, paint, chips, report button
+   ---- input ............ PRESS / SHAKE tables, chooser (picks the input method that works)
+   ---- game logic ....... getRod, getReel, castLine, shakeOnce
+   ---- reel brain ....... newBrain (pure maths), memFor (per-rod memory), playReel
+   ---- self-repair ...... report + notify, goHome, recover, failed
+   local function cycle() . one fish: cast, wait, shake, reel, cooldown
+   ---- go ............... the loops that run it, plus the watchdog
+
+  Quick fixes
+   Broke after a game update   : tap Debug, cast once, tap Copy report, read the PlayerGui line
+                                 and the GUI trees, then fix GUI_SHAKE / SHAKE_BUTTON / GUI_REEL /
+                                 BAR_NAME / FISH_NAME in CFG.
+   Too slow / too fast         : CAST_HOLD, COOLDOWN, SHAKE_FIRST, SHAKE_GAP.
+   Counts fish it lost         : raise CATCH_MIN_ACC (changes counting only, not catching).
+   Uses the wrong rod          : ROD_NAME = "Exact Rod Name".
+   Keeps walking back / pauses : bigger GUARD_STUDS, or GUARD = false.
+   Reel feels off after a swap : REMEMBER_CAL = false (or delete autofish_v6.json).
+
+  Stuck?  : tap the Debug chip (or set DEBUG = true) and read the [autofish] lines in the console.
+  Risk    : nothing here is ban-proof. Fisch staff are banning macro/exploit users right now,
+            so use an alt account and don't leave it running for hours.
+]]
+
+local CFG = {
+    -- names the game uses (case doesn't matter, a close match is tried too)
+    GUI_SHAKE    = "shakeui",
+    SHAKE_BUTTON = "button",
+    GUI_REEL     = "reel",
+    BAR_NAME     = "playerbar",   -- the white bar you control
+    FISH_NAME    = "fish",        -- the fish icon it has to cover
+    ROD_NAME     = nil,           -- exact rod name, e.g. "Training Rod"; nil = first rod found
+
+    -- input methods, tried in this order; the one that works is kept
+    CAST_ORDER   = { "mouse", "mouse2", "touch", "activate" },
+    SHAKE_ORDER  = { "nav", "click", "tap", "signal" },
+    HOLD_ORDER   = { "mouse", "space", "touch" },   -- reel: holding moves the bar right
+
+    -- timing in seconds; { min, max } is re-rolled every time
+    CAST_HOLD    = { 1.0, 1.5 },
+    CAST_VERIFY  = 5,             -- how long to wait for the bobber / shake GUI after a cast
+    SHAKE_FIRST  = { 0.20, 0.55 },-- reaction time before the first shake press
+    SHAKE_GAP    = { 0.10, 0.28 },
+    REEL_START   = { 0.15, 0.45 },-- reaction time before the reel starts (Human on)
+    COOLDOWN     = { 4.0, 5.5 },   -- was 1.5-3.5: casts under ~3s after a catch failed about half the time
+    TIMEOUT      = 20,            -- no bite after this long -> pull the line back and recast
+    REEL_TIMEOUT = 60,
+    REEL_LAT     = 0.03,
+
+    HUMAN        = true,          -- skewed timing, mood/tiredness, bar a bit off-centre; off = max precision
+    PERFECT      = true,
+    LAPSE        = 0.04,          -- chance of a short "looked away" pause before a shake press
+    GUARD        = true,          -- walk back if the character gets moved off the spot (fishes from there if it can't)
+    GUARD_STUDS  = 18,
+    MAX_FAILS    = 6,             -- failed casts / no bites in a row before a repair step (it never stops)
+    CATCH_MIN_ACC = 0.5,  -- a reel counts as caught if the fish was in the bar this much
+    WALK_HOME     = true, -- when moved away from the spot, walk back instead of pausing
+    WATCHDOG      = 240,  -- seconds without a finished reel before self-repair starts (0 = off)
+    REMEMBER_CAL  = true, -- keep the reel brain's learned bar response between executes (false = relearn)
+    NOTIFY_URL    = "",   -- Discord webhook URL, "" = off (don't share the script with it filled in)
+    NOTIFY_EVERY  = 0,    -- minutes between status pings; 0 = only ping on watchdog repairs
+    LOG_KEEP      = 140,   -- log lines kept for "Copy report"
+
+    ANTI_AFK     = true,
+    RECOVER      = true,
+    SAVE         = true,          -- remember panel position and chips (needs writefile)
+    DEBUG        = false,         -- print [autofish] lines (the game can read the output log)
+}
+
+local Players      = game:GetService("Players")
+local VIM          = game:GetService("VirtualInputManager")
+local VU           = game:GetService("VirtualUser")
+local GuiService   = game:GetService("GuiService")
+local UIS          = game:GetService("UserInputService")
+local RunService   = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local HttpService  = game:GetService("HttpService")
+local lp           = Players.LocalPlayer
+local pg           = lp:WaitForChild("PlayerGui")
+
+-- executing again (any version) shuts the old copy down first
+local env = (getgenv and getgenv()) or _G
+if type(env.__autofish_stop) == "function" then pcall(env.__autofish_stop) end
+
+local running, count, stage, stopped = true, 0, "start", false
+local gui, ui, afk, dbg, recorder
+local note = ""
+local sessionStart, restedAt = os.clock(), os.clock()
+local curAcc, lastAcc, accHit, accAll = nil, nil, 0, 0
+local fails, home, mood = 0, nil, 1
+
+-- network ping in ms (Player:GetNetworkPing is the round trip in seconds), sampled every 2s for the report
+local PING = { now = nil, sum = 0, n = 0, max = 0, at = 0 }
+local function samplePing()
+    local ok, v = pcall(function() return lp:GetNetworkPing() end)
+    if ok and type(v) == "number" then
+        local ms = v * 1000
+        PING.now, PING.sum, PING.n = ms, PING.sum + ms, PING.n + 1
+        if ms > PING.max then PING.max = ms end
+    end
+end
+local function pingText()
+    return PING.now and string.format("%dms", math.floor(PING.now + 0.5)) or "?"
+end
+
+-- counters for the report; LIFE and cal are also saved to disk
+local ST = { casts = 0, castMiss = 0, shakeHit = 0, shakeMiss = 0, reels = 0, reelSecs = 0,
+             away = 0, errors = 0, waitSum = 0, waitN = 0, lastErr = "", fixes = 0, lastFish = os.clock() }
+local LIFE = { catches = 0, secs = 0, runs = 0 }
+local cal = {}          -- per rod: what the reel brain learned about the bar (see memFor)
+local copyReport        -- assigned in the report section; the panel button calls it
+local HK = { q = {}, tally = {}, n5 = 0, away5 = 0, winUntil = 0, keys = {}, txt = {}, conns = {} }
+if CFG.NOTIFY_FISH == nil then CFG.NOTIFY_FISH = true end        -- fish list every FISH_EVERY minutes
+if CFG.NOTIFY_EVENTS == nil then CFG.NOTIFY_EVENTS = true end    -- live events
+CFG.FISH_EVERY = tonumber(CFG.FISH_EVERY) or 5
+pcall(function()   -- webhook settings get their own file, so the URL never ends up in the main save or the report
+    if type(isfile) == "function" and isfile("autofish_hook.json") then
+        local d = HttpService:JSONDecode(readfile("autofish_hook.json"))
+        if type(d.hook) == "string" and d.hook ~= "" then CFG.NOTIFY_URL = d.hook end
+        if type(d.fish) == "boolean" then CFG.NOTIFY_FISH = d.fish end
+        if type(d.events) == "boolean" then CFG.NOTIFY_EVENTS = d.events end
+    end
+end)
+
+---------------------------------------------------------------- helpers
+
+local logbuf, t00 = {}, os.clock()   -- the last CFG.LOG_KEEP lines, for "Copy report"
+
+-- the last line shows in the panel; it only reaches the console when Debug is on
+local function log(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    note = table.concat(parts, " ")
+    logbuf[#logbuf + 1] = string.format("%5ds  %s", math.floor(os.clock() - t00), note)
+    if #logbuf > (tonumber(CFG.LOG_KEEP) or 80) then table.remove(logbuf, 1) end
+    if CFG.DEBUG then print("[autofish]", note) end
+end
+
+local function rand(t)
+    if type(t) == "table" then return t[1] + math.random() * (t[2] - t[1]) end
+    return t
+end
+
+local function clamp(v, a, b)
+    if v < a then return a elseif v > b then return b end
+    return v
+end
+
+local function gauss()
+    return math.sqrt(-2 * math.log(math.random() + 1e-9)) * math.cos(2 * math.pi * math.random())
+end
+
+-- a delay in { min, max }: uniform with Human off; with Human on it is right-skewed like a real
+-- reaction time (most near the low-middle, the odd slow one), scaled by mood and tiredness
+local function human(t)
+    if type(t) ~= "table" then return t end
+    local lo, hi = t[1], t[2]
+    if not CFG.HUMAN then return lo + math.random() * (hi - lo) end
+    local x = 0.32 + 0.17 * gauss()
+    if math.random() < 0.06 then x = x + 0.3 + math.random() * 0.4 end
+    x = clamp(x, 0, 1.3)
+    local tired = 1 + 0.2 * math.min(1, (os.clock() - restedAt) / 7200)
+    return (lo + (hi - lo) * x) * mood * tired
+end
+
+local function pause(t) task.wait(human(t)) end
+
+-- now and then a person looks away for a moment
+local function lapse(extra)
+    if CFG.HUMAN and not CFG.PERFECT and math.random() < CFG.LAPSE then
+        local t = 0.6 + math.random() * extra
+        log(string.format("lapse %.1fs", t))
+        task.wait(t)
+    end
+end
+
+local function px(v) return math.floor(v + 0.5) end
+
+-- exists, is parented and, for a ScreenGui, is switched on
+local function up(g)
+    return g ~= nil and g.Parent ~= nil and (not g:IsA("ScreenGui") or g.Enabled)
+end
+
+-- false only once this copy has been shut down (executing again); losing the panel does not stop it
+local function alive()
+    return not stopped
+end
+
+local function names(inst)
+    local t = {}
+    for _, c in ipairs(inst:GetChildren()) do t[#t + 1] = c.Name end
+    return table.concat(t, ", ")
+end
+
+local function tree(inst, depth, budget)
+    for _, c in ipairs(inst:GetChildren()) do
+        if budget[1] <= 0 then return end
+        budget[1] = budget[1] - 1
+        log(string.rep("  ", depth) .. c.Name .. " (" .. c.ClassName .. ")")
+        tree(c, depth + 1, budget)
+    end
+end
+
+-- FindFirstChild that ignores case
+local function find(parent, name, deep)
+    local c = parent:FindFirstChild(name, deep)
+    if c then return c end
+    local want = name:lower()
+    for _, d in ipairs(deep and parent:GetDescendants() or parent:GetChildren()) do
+        if d.Name:lower() == want then return d end
+    end
+    return nil
+end
+
+-- first GuiObject below parent whose name contains key
+local function like(parent, key)
+    for _, d in ipairs(parent:GetDescendants()) do
+        if d:IsA("GuiObject") and d.Name:lower():find(key, 1, true) then return d end
+    end
+    return nil
+end
+
+-- an enabled ScreenGui in PlayerGui: exact name first, then one that merely contains it
+local function getGui(key)
+    local k, close = key:lower(), nil
+    for _, c in ipairs(pg:GetChildren()) do
+        if c:IsA("ScreenGui") and c.Enabled then
+            local n = c.Name:lower()
+            if n == k then return c end
+            if not close and n:find(k, 1, true) then close = c end
+        end
+    end
+    return close
+end
+
+local function viewport()
+    local c = workspace.CurrentCamera
+    return c and c.ViewportSize or Vector2.new(1280, 720)
+end
+
+local function inset()
+    local ok, v = pcall(function() return (GuiService:GetGuiInset()) end)
+    return ok and v or Vector2.zero
+end
+
+local function randName()
+    local t = {}
+    for i = 1, 10 + math.random(0, 6) do
+        local r = math.random(1, 3)
+        t[i] = string.char(r == 1 and math.random(65, 90) or r == 2 and math.random(97, 122) or math.random(48, 57))
+    end
+    return table.concat(t)
+end
+
+---------------------------------------------------------------- settings + session
+
+local SAVE_FILE, OLD_FILE = "autofish_v6.json", "autofish_v4.json"
+local saved = {}
+if CFG.SAVE and type(isfile) == "function" and type(readfile) == "function" then
+    pcall(function()
+        local f = isfile(SAVE_FILE) and SAVE_FILE or (isfile(OLD_FILE) and OLD_FILE or nil)   -- v4 / v5 settings carry over
+        if f then
+            local d = HttpService:JSONDecode(readfile(f))
+            if type(d) == "table" then saved = d end
+        end
+    end)
+end
+for _, k in ipairs({ "HUMAN", "RECOVER" }) do
+    if type(saved[k]) == "boolean" then CFG[k] = saved[k] end
+end
+if type(saved.life) == "table" then
+    for _, k in ipairs({ "catches", "secs", "runs" }) do
+        if type(saved.life[k]) == "number" then LIFE[k] = saved.life[k] end
+    end
+end
+LIFE.runs = LIFE.runs + 1
+if CFG.REMEMBER_CAL and type(saved.cal) == "table" then   -- per rod, as a multiple of the track length
+    for rodName, c in pairs(saved.cal) do
+        if type(rodName) == "string" and type(c) == "table" and type(c.h) == "number" and type(c.r) == "number" then
+            cal[rodName] = { nh = c.h, nr = c.r, n = tonumber(c.n) or 0 }
+        end
+    end
+end
+
+local function save()
+    if not (CFG.SAVE and type(writefile) == "function") then return end
+    pcall(function()
+        local c = ui and ui.card
+        local calOut = {}
+        if CFG.REMEMBER_CAL then
+            for rodName, m in pairs(cal) do
+                if m.aHold and m.aRel and m.len and m.len > 50 then
+                    calOut[rodName] = { h = m.aHold / m.len, r = m.aRel / m.len, n = m.n or 0 }
+                elseif m.nh and m.nr then
+                    calOut[rodName] = { h = m.nh, r = m.nr, n = m.n or 0 }
+                end
+            end
+        end
+        writefile(SAVE_FILE, HttpService:JSONEncode({
+            HUMAN = CFG.HUMAN, RECOVER = CFG.RECOVER,
+            min = ui and ui.collapsed or false,
+            x = c and c.Position.X.Offset, y = c and c.Position.Y.Offset,
+            life = LIFE, cal = calOut,
+        }))
+    end)
+end
+
+local function newSession()
+    sessionStart, restedAt = os.clock(), os.clock()
+    count, lastAcc, curAcc, accHit, accAll, fails = 0, nil, nil, 0, 0, 0
+end
+newSession()
+
+---------------------------------------------------------------- panel
+
+local PAL = {
+    bg0   = Color3.fromRGB(31, 35, 50),  bg1   = Color3.fromRGB(14, 16, 23),
+    line  = Color3.fromRGB(72, 80, 108), cell  = Color3.fromRGB(23, 26, 37),
+    track = Color3.fromRGB(40, 45, 61),  text  = Color3.fromRGB(238, 241, 249),
+    dim   = Color3.fromRGB(130, 139, 163),
+    good  = Color3.fromRGB(62, 207, 128), warn = Color3.fromRGB(255, 190, 70), bad = Color3.fromRGB(236, 90, 90),
+    onBtn = Color3.fromRGB(28, 124, 80), offBtn = Color3.fromRGB(174, 56, 56), chipOn = Color3.fromRGB(40, 94, 142),
+}
+
+local STAGES = {
+    start    = { "Starting",              Color3.fromRGB(150, 160, 186) },
+    cast     = { "Casting",               Color3.fromRGB(88, 160, 255) },
+    wait     = { "Waiting for a bite",    Color3.fromRGB(255, 196, 70) },
+    shake    = { "Shaking",               Color3.fromRGB(176, 128, 255) },
+    reel     = { "Reeling",               Color3.fromRGB(62, 214, 130) },
+    cooldown = { "Cooldown",              Color3.fromRGB(120, 134, 164) },
+    paused   = { "Paused",                Color3.fromRGB(236, 90, 90) },
+    walk = { "Walking back",   Color3.fromRGB(70, 204, 204) },
+    fix  = { "Repairing",      Color3.fromRGB(255, 150, 60) },
+}
+
+local function mk(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+
+local function round(o, r) return mk("UICorner", { CornerRadius = UDim.new(0, r) }, o) end
+
+local function label(parent, s, size, font, color, pos, sz, align)
+    return mk("TextLabel", {
+        BackgroundTransparency = 1, BorderSizePixel = 0, Text = s, TextSize = size, Font = font,
+        TextColor3 = color, Position = pos, Size = sz, TextTruncate = Enum.TextTruncate.AtEnd,
+        TextXAlignment = align or Enum.TextXAlignment.Left,
+    }, parent)
+end
+
+local function tween(o, props, t)
+    pcall(function()
+        TweenService:Create(o, TweenInfo.new(t or 0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+    end)
+end
+
+local shownText = setmetatable({}, { __mode = "k" })
+local function setText(o, s)       -- only touch the property when it changed
+    if shownText[o] ~= s then
+        shownText[o] = s
+        o.Text = s
+    end
+end
+
+local function fmtTime(s)
+    s = math.max(0, math.floor(s))
+    return string.format("%02d:%02d:%02d", math.floor(s / 3600), math.floor(s / 60) % 60, s % 60)
+end
+
+local function accColor(a)
+    if a == nil then return PAL.dim end
+    if a >= 0.9 then return PAL.good elseif a >= 0.75 then return PAL.warn end
+    return PAL.bad
+end
+
+local function buildPanel(root)
+    local W, HF, WM, HM = 232, 260, 190, 36
+    local u = { collapsed = saved.min == true }
+    local sg = mk("ScreenGui", {
+        Name = randName(), ResetOnSpawn = false, DisplayOrder = 999,
+        IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    })
+    local v = viewport()
+    local x0 = clamp(tonumber(saved.x) or 10, 0, math.max(0, v.X - 120))
+    local y0 = clamp(tonumber(saved.y) or 58, 0, math.max(0, v.Y - 60))
+
+    local card = mk("Frame", {
+        Name = "c", BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Active = true,
+        ClipsDescendants = true, Position = UDim2.fromOffset(x0, y0),
+        Size = UDim2.fromOffset(u.collapsed and WM or W, u.collapsed and HM or HF),
+    }, sg)
+    round(card, 14)
+    mk("UIGradient", { Color = ColorSequence.new(PAL.bg0, PAL.bg1), Rotation = 90 }, card)
+    u.stroke = mk("UIStroke", { Color = PAL.line, Thickness = 1.2, Transparency = 0.15 }, card)
+
+    -- header: dot, title (or the pill text when shrunk), shrink button; also the drag handle
+    local head = mk("Frame", { BackgroundTransparency = 1, Active = true, Size = UDim2.new(1, 0, 0, HM) }, card)
+    u.dot = mk("Frame", {
+        BackgroundColor3 = PAL.dim, BorderSizePixel = 0,
+        Position = UDim2.fromOffset(13, 13), Size = UDim2.fromOffset(10, 10),
+    }, head)
+    round(u.dot, 5)
+    u.title = label(head, "AutoFish", 14, Enum.Font.GothamBold, PAL.text, UDim2.fromOffset(31, 0), UDim2.new(0, 70, 1, 0))
+    u.tag   = label(head, "v6", 11, Enum.Font.GothamMedium, PAL.dim, UDim2.fromOffset(98, 1), UDim2.new(0, 40, 1, 0))
+    u.pill  = label(head, "", 12, Enum.Font.GothamBold, PAL.text, UDim2.fromOffset(31, 0), UDim2.new(1, -66, 1, 0))
+    u.min = mk("TextButton", {
+        AutoButtonColor = false, BackgroundColor3 = PAL.cell, BorderSizePixel = 0, Text = "-",
+        TextSize = 16, Font = Enum.Font.GothamBold, TextColor3 = PAL.dim,
+        Position = UDim2.new(1, -36, 0, 5), Size = UDim2.fromOffset(28, 26),
+    }, head)
+    round(u.min, 8)
+
+    -- body
+    local body = mk("Frame", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(0, HM), Size = UDim2.new(1, 0, 1, -HM),
+    }, card)
+    u.body = body
+    u.stage = label(body, "Starting", 13, Enum.Font.GothamBold, PAL.dim, UDim2.fromOffset(12, 0), UDim2.fromOffset(140, 22))
+    u.time  = label(body, "00:00:00", 11, Enum.Font.GothamMedium, PAL.dim, UDim2.new(1, -92, 0, 0),
+        UDim2.fromOffset(80, 22), Enum.TextXAlignment.Right)
+
+    local function cell(i, caption)
+        local c = mk("Frame", {
+            BackgroundColor3 = PAL.cell, BorderSizePixel = 0,
+            Position = UDim2.fromOffset(12 + (i - 1) * 72, 26), Size = UDim2.fromOffset(66, 40),
+        }, body)
+        round(c, 9)
+        label(c, caption, 9, Enum.Font.GothamMedium, PAL.dim, UDim2.fromOffset(8, 4), UDim2.new(1, -16, 0, 12))
+        return label(c, "-", 17, Enum.Font.GothamBold, PAL.text, UDim2.fromOffset(8, 16), UDim2.new(1, -16, 0, 20))
+    end
+    u.caught = cell(1, "CAUGHT")
+    u.rate   = cell(2, "PER HOUR")
+    u.acc    = cell(3, "ACCURACY")
+
+    local bar = mk("Frame", {
+        BackgroundColor3 = PAL.track, BorderSizePixel = 0,
+        Position = UDim2.fromOffset(12, 73), Size = UDim2.fromOffset(208, 4), ClipsDescendants = true,
+    }, body)
+    round(bar, 2)
+    u.fill = mk("Frame", { BackgroundColor3 = PAL.dim, BorderSizePixel = 0, Size = UDim2.new(0, 0, 1, 0) }, bar)
+
+    u.btn = mk("TextButton", {
+        AutoButtonColor = false, BackgroundColor3 = PAL.onBtn, BorderSizePixel = 0, Text = "RUNNING",
+        TextSize = 12, Font = Enum.Font.GothamBold, TextColor3 = PAL.text,
+        Position = UDim2.fromOffset(12, 84), Size = UDim2.fromOffset(208, 32),
+    }, body)
+    round(u.btn, 9)
+
+    local defs = { { "Human", "HUMAN" }, { "Fix", "RECOVER" }, { "Debug", "DEBUG" }, { "Perfect", "PERFECT" } }
+    for i, d in ipairs(defs) do
+        local chip = mk("TextButton", {
+            AutoButtonColor = false, BorderSizePixel = 0, Text = d[1], TextSize = 11, Font = Enum.Font.GothamMedium,
+            Position = UDim2.fromOffset(12 + (i - 1) * 53, 124), Size = UDim2.fromOffset(49, 24),
+        }, body)
+        round(chip, 8)
+        local function look()
+            local on = CFG[d[2]]
+            chip.BackgroundColor3 = on and PAL.chipOn or PAL.cell
+            chip.TextColor3 = on and PAL.text or PAL.dim
+        end
+        look()
+        chip.Activated:Connect(function()
+            CFG[d[2]] = not CFG[d[2]]
+            look()
+            save()
+        end)
+    end
+
+    u.rep = mk("TextButton", {
+        AutoButtonColor = false, BackgroundColor3 = PAL.cell, BorderSizePixel = 0, Text = "Copy report",
+        TextSize = 11, Font = Enum.Font.GothamMedium, TextColor3 = PAL.dim,
+        Position = UDim2.fromOffset(12, 154), Size = UDim2.fromOffset(155, 24),
+    }, body)
+    round(u.rep, 8)
+    u.rep.Activated:Connect(function()
+        local ok, how = pcall(function() return copyReport() end)
+        u.rep.Text = (ok and how == "clipboard") and "Copied - paste in a chat"
+            or (ok and how == "console") and "No clipboard - see console"
+            or "Report failed"
+        task.delay(2.2, function()
+            if u.rep and u.rep.Parent then u.rep.Text = "Copy report" end
+        end)
+    end)
+
+    u.note = label(body, "", 10, Enum.Font.Gotham, PAL.dim, UDim2.fromOffset(12, 184), UDim2.fromOffset(208, 14))
+    u.stat = label(body, "", 10, Enum.Font.Gotham, PAL.dim, UDim2.fromOffset(12, 200), UDim2.fromOffset(208, 14))
+
+    -- webhook: the "Hook" chip opens a hidden row with the URL box + Fish / Event / Test
+    local hookRow = mk("Frame", {
+        BackgroundTransparency = 1, Visible = false,
+        Position = UDim2.fromOffset(0, 214), Size = UDim2.new(1, 0, 0, 64),
+    }, body)
+    local hasUrl = (CFG.NOTIFY_URL or "") ~= ""
+    u.hookBox = mk("TextBox", {
+        BackgroundColor3 = PAL.cell, BorderSizePixel = 0, ClearTextOnFocus = false, ClipsDescendants = true,
+        PlaceholderText = "paste Discord webhook URL", PlaceholderColor3 = PAL.dim,
+        Text = hasUrl and ("webhook saved  ..." .. CFG.NOTIFY_URL:sub(-6)) or "",
+        TextSize = 10, Font = Enum.Font.Gotham, TextColor3 = PAL.text, TextXAlignment = Enum.TextXAlignment.Left,
+        Position = UDim2.fromOffset(12, 8), Size = UDim2.fromOffset(208, 26),
+    }, hookRow)
+    round(u.hookBox, 8)
+    mk("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, u.hookBox)
+    u.hookBox.Focused:Connect(function()
+        u.hookBox.Text, u.hookBox.PlaceholderText = "", "paste Discord webhook URL"
+        task.delay(30, function()   -- a box that keeps the keyboard focus would swallow the script's own key presses
+            if u.hookBox.Parent and u.hookBox:IsFocused() then u.hookBox:ReleaseFocus() end
+        end)
+    end)
+    u.hookBox.FocusLost:Connect(function() pcall(HK.typed, u.hookBox.Text) end)
+
+    local function hookChip(i, text, key)
+        local chip = mk("TextButton", {
+            AutoButtonColor = false, BorderSizePixel = 0, Text = text, TextSize = 11, Font = Enum.Font.GothamMedium,
+            Position = UDim2.fromOffset(12 + (i - 1) * 53, 40), Size = UDim2.fromOffset(49, 24),
+        }, hookRow)
+        round(chip, 8)
+        local function look()
+            local on = key == nil or CFG[key]
+            chip.BackgroundColor3 = (key and on) and PAL.chipOn or PAL.cell
+            chip.TextColor3 = (key and on) and PAL.text or PAL.dim
+        end
+        look()
+        chip.Activated:Connect(function()
+            if key then
+                CFG[key] = not CFG[key]
+                look()
+                pcall(HK.save)
+            else
+                task.spawn(function() pcall(HK.test) end)
+            end
+        end)
+    end
+    hookChip(1, "Fish", "NOTIFY_FISH")
+    hookChip(2, "Event", "NOTIFY_EVENTS")
+    hookChip(3, "Test", nil)
+
+    local hookBtn = mk("TextButton", {
+        AutoButtonColor = false, BorderSizePixel = 0, Text = "Hook", TextSize = 11, Font = Enum.Font.GothamMedium,
+        Position = UDim2.fromOffset(171, 154), Size = UDim2.fromOffset(49, 24),
+    }, body)
+    round(hookBtn, 8)
+    local hookOpen = false
+    local function hookLook()
+        local lit = hookOpen or (CFG.NOTIFY_URL or "") ~= ""
+        hookBtn.BackgroundColor3 = lit and PAL.chipOn or PAL.cell
+        hookBtn.TextColor3 = lit and PAL.text or PAL.dim
+    end
+    hookLook()
+    u.hookLook = hookLook
+    hookBtn.Activated:Connect(function()
+        hookOpen = not hookOpen
+        hookRow.Visible = hookOpen
+        HF = hookOpen and 322 or 260          -- setCollapsed() reads HF too, so shrink / expand keeps working
+        if not u.collapsed then tween(card, { Size = UDim2.fromOffset(W, HF) }, 0.18) end
+        hookLook()
+    end)
+
+    -- shrink / expand
+    local function setCollapsed(c)
+        u.collapsed = c
+        body.Visible = not c
+        u.title.Visible, u.tag.Visible, u.pill.Visible = not c, not c, c
+        u.min.Text = c and "+" or "-"
+        tween(card, { Size = UDim2.fromOffset(c and WM or W, c and HM or HF) }, 0.18)
+    end
+    u.min.Activated:Connect(function()
+        setCollapsed(not u.collapsed)
+        save()
+    end)
+    setCollapsed(u.collapsed)
+
+    -- drag by the header
+    local dragging, from, startPos = false, nil, nil
+    head.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, from, startPos = true, i.Position, card.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    save()
+                end
+            end)
+        end
+    end)
+    u.conn = UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d, vp = i.Position - from, viewport()
+            card.Position = UDim2.fromOffset(
+                clamp(startPos.X.Offset + d.X, 0, math.max(0, vp.X - 80)),
+                clamp(startPos.Y.Offset + d.Y, 0, math.max(0, vp.Y - 40)))
+        end
+    end)
+
+    u.card, u.gui = card, sg
+    sg.Parent = root
+    return u
+end
+
+local function paint()
+    if not ui then return end
+    local st = STAGES[stage] or STAGES.start
+    local col = st[2]
+    if ui.col ~= col then
+        ui.col = col
+        tween(ui.dot, { BackgroundColor3 = col })
+        tween(ui.stage, { TextColor3 = col })
+        tween(ui.stroke, { Color = col })
+    end
+    local el = os.clock() - sessionStart
+    local a = (stage == "reel" and curAcc) or lastAcc
+    setText(ui.stage, st[1])
+    setText(ui.pill, string.format("%s - %d", st[1], count))
+    setText(ui.time, fmtTime(el))
+    setText(ui.caught, tostring(count))
+    setText(ui.rate, (count > 0 and el > 90) and tostring(px(count / (el / 3600))) or "-")
+    setText(ui.acc, a and string.format("%d%%", px(a * 100)) or "-")
+    ui.acc.TextColor3 = accColor(a)
+    ui.fill.BackgroundColor3 = accColor(a)
+    ui.fill.Size = UDim2.new(a or 0, 0, 1, 0)
+    setText(ui.btn, running and "RUNNING  -  tap to pause" or "PAUSED  -  tap to resume")
+    ui.btn.BackgroundColor3 = running and PAL.onBtn or PAL.offBtn
+    setText(ui.note, note)
+    setText(ui.stat, string.format("last fish %ds | fixes %d", px(os.clock() - ST.lastFish), ST.fixes))
+end
+
+local function setRunning(v)
+    if v == running then return end
+    local midReel = (stage == "reel")
+    running = v
+    if v then
+        fails, home, ST.lastFish = 0, nil, os.clock()
+        stage = "start"
+    else
+        stage = "paused"
+        if midReel then log("finishing this reel, then pausing") end
+    end
+    paint()
+end
+
+-- the panel lives in a hidden UI container, never inside PlayerGui
+local okHost, root = pcall(function() return (gethui and gethui()) or game:GetService("CoreGui") end)
+if okHost and root then
+    pcall(function()
+        local old = root:FindFirstChild("AutoFishToggle")   -- left behind by v3
+        if old then old:Destroy() end
+    end)
+    local okUi, res = pcall(buildPanel, root)
+    if okUi then
+        ui, gui = res, res.gui
+        ui.btn.Activated:Connect(function() setRunning(not running) end)
+    else
+        log("panel failed: " .. tostring(res))
+    end
+else
+    log("no hidden UI container on this executor - running without the panel")
+end
+paint()
+
+if CFG.ANTI_AFK then
+    afk = lp.Idled:Connect(function()
+        VU:CaptureController()
+        VU:ClickButton2(Vector2.new())
+    end)
+end
+
+if CFG.DEBUG then
+    local seen = {}
+    dbg = pg.ChildAdded:Connect(function(c)
+        if not seen[c.Name] then
+            seen[c.Name] = true
+            log("new GUI:", c.Name, c.ClassName)
+        end
+    end)
+    local okx, ex = pcall(function() return identifyexecutor() end)
+    log("v6 | executor:", okx and ex or "?", "| touch:", UIS.TouchEnabled,
+        "| keyboard:", UIS.KeyboardEnabled, "| firesignal:", type(firesignal) == "function")
+    log("PlayerGui right now:", names(pg))
+end
+
+env.__autofish_stop = function()
+    stopped, running = true, false
+    if afk then afk:Disconnect() end
+    if dbg then dbg:Disconnect() end
+    if ui and ui.conn then ui.conn:Disconnect() end
+    if recorder then recorder:Disconnect() end
+    if gui then pcall(function() gui:Destroy() end) end
+end
+
+---------------------------------------------------------------- input
+
+-- is something that swallows clicks (a button, an Active frame) drawn at this spot?
+local function blocked(x, y)
+    local ins = inset()
+    for _, yy in ipairs({ y, px(y - ins.Y) }) do
+        local ok, list = pcall(function() return pg:GetGuiObjectsAtPosition(x, yy) end)
+        if ok then
+            for _, o in ipairs(list) do
+                if o.Visible and (o.Active or o:IsA("GuiButton") or o:IsA("TextBox")) then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- is our own panel in the way? (it is not in PlayerGui, so blocked() cannot see it)
+local function overUs(x, y)
+    if not (ui and ui.card and ui.card.Parent) then return false end
+    local p, s, ins = ui.card.AbsolutePosition, ui.card.AbsoluteSize, inset()
+    for _, yy in ipairs({ y, y - ins.Y }) do
+        if x >= p.X - 12 and x <= p.X + s.X + 12 and yy >= p.Y - 12 and yy <= p.Y + s.Y + 12 then return true end
+    end
+    return false
+end
+
+local SPOTS = {
+    { 0.5, 0.42 }, { 0.5, 0.30 }, { 0.36, 0.40 }, { 0.64, 0.40 }, { 0.5, 0.58 },
+    { 0.75, 0.5 }, { 0.62, 0.30 }, { 0.25, 0.5 }, { 0.72, 0.62 },
+}
+
+-- a spot on the 3D world that no GUI covers, a little different every time
+local function point()
+    local v = viewport()
+    for _, s in ipairs(SPOTS) do
+        local x = px(v.X * (s[1] + (math.random() - 0.5) * 0.04))
+        local y = px(v.Y * (s[2] + (math.random() - 0.5) * 0.04))
+        if not blocked(x, y) and not overUs(x, y) then return x, y end
+    end
+    return px(v.X * 0.5), px(v.Y * 0.45)
+end
+
+-- press / release, one function per way of sending it
+local PRESS = {
+    mouse  = function(down, x, y) VIM:SendMouseButtonEvent(x, y, 0, down, game, 1) end,
+    mouse2 = function(down, x, y) VIM:SendMouseButtonEvent(x, y, 0, down, lp, 0) end,
+    touch  = function(down, x, y) VIM:SendTouchEvent(5, down and 0 or 2, x, y) end,
+    space  = function(down) VIM:SendKeyEvent(down, Enum.KeyCode.Space, false, game) end,
+}
+
+-- somewhere inside a GUI button, in screen coordinates (the top-bar inset is added when needed)
+local function btnPoint(b)
+    local sg = b:FindFirstAncestorOfClass("ScreenGui")
+    local ins = (sg and sg.IgnoreGuiInset) and Vector2.zero or inset()
+    local p, s = b.AbsolutePosition, b.AbsoluteSize
+    return px(p.X + s.X * (0.3 + math.random() * 0.4) + ins.X),
+           px(p.Y + s.Y * (0.3 + math.random() * 0.4) + ins.Y)
+end
+
+local SHAKE = {
+    nav = function(b)      -- select the button and hit Enter, no coordinates involved
+        GuiService.SelectedObject = b
+        VIM:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+        task.wait(0.03)
+        VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+        task.wait(0.03)
+        GuiService.SelectedObject = nil
+    end,
+    click = function(b)
+        local x, y = btnPoint(b)
+        PRESS.mouse(true, x, y)
+        task.wait(0.03 + math.random() * 0.05)
+        PRESS.mouse(false, x, y)
+    end,
+    tap = function(b)
+        local x, y = btnPoint(b)
+        PRESS.touch(true, x, y)
+        task.wait(0.04 + math.random() * 0.04)
+        PRESS.touch(false, x, y)
+    end,
+    signal = function(b)   -- only if the executor has firesignal
+        firesignal(b.MouseButton1Click)
+        firesignal(b.Activated)
+    end,
+}
+
+local function castWith(name, rod, x, y)
+    if name == "activate" then
+        rod:Activate()
+        task.wait(rand(CFG.CAST_HOLD))
+        pcall(function() rod:Deactivate() end)
+    else
+        PRESS[name](true, x, y)
+        task.wait(rand(CFG.CAST_HOLD))
+        PRESS[name](false, x, y)
+    end
+end
+
+-- keeps one working method per job; after `need` misses in a row it moves to the next one
+local function chooser(list, need)
+    local c = { i = 1, wins = {}, fails = {} }
+    function c.cur() return list[c.i] end
+    function c.ok()
+        local k = list[c.i]
+        c.wins[k] = (c.wins[k] or 0) + 1
+        c.fails[k] = 0
+    end
+    function c.bad()
+        local k = list[c.i]
+        c.fails[k] = (c.fails[k] or 0) + 1
+        if c.fails[k] >= need + ((c.wins[k] or 0) > 0 and 2 or 0) then
+            c.fails[k] = 0
+            c.i = c.i % #list + 1
+            log("switching to", list[c.i])
+        end
+    end
+    return c
+end
+
+local C = chooser(CFG.CAST_ORDER, 1)
+local S = chooser(CFG.SHAKE_ORDER, 3)
+local H = chooser(CFG.HOLD_ORDER, 3)
+
+---------------------------------------------------------------- game logic
+
+local function isRod(t)
+    if not t:IsA("Tool") then return false end
+    local n = t.Name:lower()
+    if CFG.ROD_NAME then return n == CFG.ROD_NAME:lower() end
+    if n:find("rod", 1, true) then return true end
+    return t:FindFirstChild("events") ~= nil and t:FindFirstChild("values") ~= nil
+        and not n:find("harpoon", 1, true) and not n:find("spear", 1, true)
+end
+
+-- the rod in your hand, or the first one in the backpack (gets equipped)
+local function getRod()
+    local char = lp.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return nil end
+    for _, t in ipairs(char:GetChildren()) do
+        if isRod(t) then return t, hum end
+    end
+    local bp = lp:FindFirstChildOfClass("Backpack")
+    if bp then
+        for _, t in ipairs(bp:GetChildren()) do
+            if isRod(t) then
+                hum:EquipTool(t)
+                task.wait(0.5)
+                return t, hum
+            end
+        end
+    end
+    return nil
+end
+
+local useBobber = true
+
+-- the game puts a "bobber" inside the rod while the line is out
+local function lineOut(rod)
+    return useBobber and rod.Parent ~= nil and rod:FindFirstChild("bobber") ~= nil
+end
+
+local function getShake()
+    return getGui(CFG.GUI_SHAKE)
+end
+
+-- visible all the way up to its ScreenGui?
+local function shown(o)
+    while o and not o:IsA("ScreenGui") do
+        if o:IsA("GuiObject") and not o.Visible then return false end
+        o = o.Parent
+    end
+    return o ~= nil
+end
+
+-- returns the reel GUI plus the white bar and the fish icon (nil while they aren't on screen)
+local function getReel()
+    local g = getGui(CFG.GUI_REEL)
+    if not g then return nil end
+    local bar  = find(g, CFG.BAR_NAME, true) or like(g, "player")
+    local fish = find(g, CFG.FISH_NAME, true) or like(g, "fish")
+    if bar and not (shown(bar) and bar.AbsoluteSize.X > 2) then bar = nil end
+    if fish and not shown(fish) then fish = nil end
+    return g, bar, fish
+end
+
+local function reelReady()
+    local g, bar, fish = getReel()
+    return g ~= nil and bar ~= nil and fish ~= nil
+end
+
+local okGuis, okTexts = nil, nil   -- enabled ScreenGuis / visible texts around the last cast that worked
+
+-- every visible piece of text on screen (counters and clocks left out), to spot a new message
+local function visibleTexts()
+    local t = {}
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and #d.Text < 80
+            and not d.Text:match("^[%d%s:%.,%%/%-+$]*$") and shown(d) then
+            t[d.Text] = true
+        end
+    end
+    return t
+end
+
+local function enabledGuis()
+    local t = {}
+    for _, c in ipairs(pg:GetChildren()) do
+        if c:IsA("ScreenGui") and c.Enabled then t[c.Name] = true end
+    end
+    return t
+end
+
+-- one line that says what is different now compared with the last cast that worked
+local function castDiag(rod, m, x, y)
+    pcall(function()
+        local ch = lp.Character
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        local fresh = {}
+        if okGuis then
+            for n in pairs(enabledGuis()) do
+                if not okGuis[n] then fresh[#fresh + 1] = n end
+            end
+            table.sort(fresh)
+        end
+        local texts = {}
+        if okTexts then
+            for tx in pairs(visibleTexts()) do
+                if not okTexts[tx] and #texts < 12 then texts[#texts + 1] = tx:gsub("[\r\n]+", " "):sub(1, 40) end
+            end
+        end
+        local away = (home and root) and tostring(math.floor((root.Position - home).Magnitude)) or "?"
+        log(string.format("diag %s: equipped=%s bobber=%s state=%s fromHome=%s menu=%s typing=%s blocked=%s ping=%s newGui=[%s]",
+            m, tostring(rod.Parent == ch), tostring(rod:FindFirstChild("bobber") ~= nil),
+            hum and tostring(hum:GetState()):gsub("Enum.HumanoidStateType.", "") or "?",
+            away, tostring(GuiService.MenuIsOpen), tostring(UIS:GetFocusedTextBox() ~= nil),
+            tostring(blocked(x, y)), pingText(), table.concat(fresh, ",")))
+        if #texts > 0 then log("diag new text: " .. table.concat(texts, " | ")) end
+    end)
+end
+
+-- cast and wait until something proves it worked; otherwise try the next method
+local function castLine(rod)
+    local resets = 0   -- rod re-equips tried in this call, before any input method gets blamed
+    for _ = 1, #CFG.CAST_ORDER * 2 do
+        if not (alive() and running) then return false end
+        local m = C.cur()
+        local x, y = point()
+        log("cast via", m)
+        local pre = enabledGuis()
+        local before = rod:FindFirstChild("bobber")
+        local stale = before ~= nil   -- a bobber already there before the cast proves nothing
+        -- with the bobber check off, the only proof is the shake / reel GUI; in the logs it shows up
+        -- about 1s after a real cast, so 8s is plenty (waiting the full TIMEOUT cost 20s per miss)
+        local window = useBobber and CFG.CAST_VERIFY or math.max(CFG.CAST_VERIFY, 8)
+        local ok, err = pcall(castWith, m, rod, x, y)
+        if not ok then
+            ST.castMiss = ST.castMiss + 1
+            log("cast method failed:", m, err)
+            if m ~= "activate" then pcall(PRESS[m], false, x, y) end
+            C.bad()
+        else
+            local t, seen = os.clock(), false
+            while alive() and running and os.clock() - t < window do
+                if lineOut(rod) or getShake() or reelReady() then
+                    seen = true
+                    break
+                end
+                local now = rod:FindFirstChild("bobber")
+                if not useBobber and now and (not stale or now ~= before) then
+                    useBobber = true
+                    log("bobber check back on")
+                    seen = true
+                    break
+                end
+                task.wait(0.1)
+            end
+            if seen then
+                ST.casts = ST.casts + 1
+                C.ok()
+                okGuis = pre
+                pcall(function() okTexts = visibleTexts() end)
+                return true
+            end
+            ST.castMiss = ST.castMiss + 1
+            log("cast via", m, "did nothing")
+            castDiag(rod, m, x, y)
+            -- in the logs all four methods failed one after another, which points at the rod / game state
+            -- and not at the input, so reset the rod first and only then blame (and rotate) the method
+            local ch = lp.Character
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            if resets < 2 and hum then
+                resets = resets + 1
+                log("re-equipping the rod before blaming '" .. m .. "'")
+                pcall(function()
+                    hum:UnequipTools()
+                    task.wait(0.5)
+                    hum:EquipTool(rod)
+                    task.wait(0.8)
+                end)
+            else
+                C.bad()
+            end
+            task.wait(0.6)
+        end
+    end
+    return false
+end
+
+-- one shake press; counts as a hit if the button vanished, closed or moved
+local shakeNamed = false
+local function findShakeButton(shake)
+    local b = find(shake, CFG.SHAKE_BUTTON, true)
+    if b and b:IsA("GuiObject") and b.Visible and b.AbsoluteSize.X > 2 then return b end
+    -- the game's button is not called "button" any more (the GUI dump shows "default", an ImageButton),
+    -- so fall back to the first visible button anywhere inside the shake GUI
+    for _, d in ipairs(shake:GetDescendants()) do
+        if d:IsA("GuiButton") and d.Visible and d.AbsoluteSize.X > 2 and shown(d) then
+            if not shakeNamed then
+                shakeNamed = true
+                log("shake button '" .. CFG.SHAKE_BUTTON .. "' not found - using '" .. d.Name .. "'")
+            end
+            return d
+        end
+    end
+    return nil
+end
+
+local function shakeOnce(shake)
+    local b = findShakeButton(shake)
+    if not b then return end
+    local m = S.cur()
+    local p0 = b.AbsolutePosition
+    local ok, err = pcall(SHAKE[m], b)
+    if not ok then
+        log("shake method failed:", m, err)
+        S.bad()
+        return
+    end
+    local t, hit = os.clock(), false
+    while os.clock() - t < 0.4 do
+        task.wait(0.03)
+        if not up(shake) or not b.Parent or not b.Visible or (b.AbsolutePosition - p0).Magnitude > 2 then
+            hit = true
+            break
+        end
+    end
+    if hit then
+        ST.shakeHit = ST.shakeHit + 1
+        S.ok()
+    else
+        ST.shakeMiss = ST.shakeMiss + 1
+        log("shake via", m, "had no effect")
+        S.bad()
+    end
+end
+
+---------------------------------------------------------------- reel brain
+-- Pure maths, no Roblox calls. Each frame it gets where the fish and the bar are and answers
+-- "hold or release?". It learns how fast the bar speeds up (hold) and slows down (release), keeps
+-- track of the commands still in flight (input lag), aims at where the fish will be, stays inside
+-- the track and brakes early enough not to overshoot.
+local function newBrain(opts)
+    opts = opts or {}
+    local human = opts.human
+    local B = {}
+    local clamp = function(v, a, b) if v < a then return a elseif v > b then return b end return v end
+
+    local ts, fs, bs, n = {}, {}, {}, 0          -- recent samples
+    local aHold, aRel = nil, nil                 -- learned accelerations (px/s^2), kept between reels
+    if opts.mem then aHold, aRel = opts.mem.aHold, opts.mem.aRel end
+    local holdNow, since, lastSwitch = false, 0, -1
+    local fv, bv, avgDt = 0, 0, 1 / 60
+    local vmax, vR, vL = 0, 0, 0
+    local wob, wobT = 0, 0
+    local stable = 0                              -- seconds the command has been unchanged
+    local hist = {}                               -- { time, command } every time the command changed
+    local function cmdAt(tau)
+        for i = #hist, 1, -1 do
+            if hist[i][1] <= tau then return hist[i][2] end
+        end
+        return false
+    end
+
+    local function slope(arr, from)
+        -- least squares slope of arr[from..n] against ts
+        local cnt = n - from + 1
+        if cnt < 2 then return 0 end
+        local mt, mx = 0, 0
+        for i = from, n do mt = mt + ts[i]; mx = mx + arr[i] end
+        mt, mx = mt / cnt, mx / cnt
+        local num, den = 0, 0
+        for i = from, n do
+            local dt = ts[i] - mt
+            num = num + dt * (arr[i] - mx)
+            den = den + dt * dt
+        end
+        if den < 1e-9 then return 0 end
+        return num / den
+    end
+
+    -- now, fish centre, bar centre, bar width, fish width, track left, track right
+    function B.step(now, f, b, bw, fw, L, R)
+        n = n + 1
+        ts[n], fs[n], bs[n] = now, f, b
+        if n > 8 then
+            table.remove(ts, 1); table.remove(fs, 1); table.remove(bs, 1); n = 8
+        end
+        if n >= 2 then
+            local d = ts[n] - ts[n - 1]
+            if d > 0 and d < 0.25 then avgDt = avgDt * 0.9 + d * 0.1 end
+        end
+        -- window: last ~80 ms, at least 3 samples when available
+        local from = n
+        local win, cap = 0.085, 5
+        if not human then win, cap = 0.05, 3 end
+        while from > 1 and (ts[n] - ts[from - 1]) <= win and n - from < cap do from = from - 1 end
+        if n - from < 2 and from > 1 then from = math.max(1, n - 2) end
+        local newFv, newBv = slope(fs, from), slope(bs, from)
+        local prevBv = bv
+        fv, bv = newFv, newBv
+        if math.abs(bv) > vmax then vmax = math.abs(bv) end
+        if bv > vR then vR = bv end
+        if -bv > vL then vL = -bv end
+
+        local len = math.max(R - L, 50)
+        local a0 = len * 4
+        if not aHold and opts.mem and opts.mem.nh then   -- calibration loaded from disk, stored as a multiple of the track
+            aHold = clamp(opts.mem.nh * len, a0 * 0.15, a0 * 12)
+            aRel  = clamp(opts.mem.nr * len, a0 * 0.15, a0 * 12)
+        end
+        if not aHold then aHold, aRel = a0, a0 end
+
+        -- learn the bar's response from stretches where the command was stable
+        stable = stable + avgDt
+        local dtv = (n >= 2) and (ts[n] - ts[n - 1]) or avgDt
+        if stable > (0.04 + 2.5 * avgDt) and dtv > 0 then
+            local acc = (bv - prevBv) / dtv
+            local pinned = (b - bw / 2 <= L + 2) or (b + bw / 2 >= R - 2)
+            if not pinned and math.abs(bv) < 0.8 * math.max(vmax, 1) + 1 then
+                if holdNow and acc > 0 then
+                    aHold = clamp(aHold * 0.93 + acc * 0.07, a0 * 0.15, a0 * 12)
+                elseif (not holdNow) and acc < 0 then
+                    aRel = clamp(aRel * 0.93 - acc * 0.07, a0 * 0.15, a0 * 12)
+                end
+            end
+        end
+
+        -- where do we want the bar? the fish, nudged a little inside the safe margin
+        local margin = math.max(0, bw / 2 - fw / 2)
+        if human then
+            if now > wobT then
+                wob = (math.random() * 2 - 1) * 0.35 * margin
+                wobT = now + 0.35 + math.random() * 0.8
+            end
+        else
+            wob = 0
+        end
+        local lat = clamp((CFG.REEL_LAT or 0.03) + 1.6 * avgDt, 0.02, 0.17)
+        local lo, hi = L + bw / 2, R - bw / 2
+        local fP = f + fv * lat
+        local comfort = clamp(1 - math.abs(f - b) / math.max(margin * 0.7, 1), 0, 1)
+        local raw = fP + wob * comfort
+        local tgt = clamp(raw, lo, hi)
+        local tv = (raw < lo or raw > hi) and 0 or fv      -- a target pinned to a wall stands still
+
+        -- where the bar will be once the commands already in flight have landed
+        local capR = (vR > len * 0.15) and vR * 1.03 or len * 0.8
+        local capL = (vL > len * 0.15) and vL * 1.03 or len * 0.8
+        local steps, h = 6, lat / 6
+        local bP, bvP = b, bv
+        for i = 1, steps do
+            local c = cmdAt(now + (i - 1) * h - lat)
+            bvP = clamp(bvP + (c and aHold or -aRel) * h, -capL, capR)
+            bP = bP + bvP * h
+        end
+        local rv = bvP - tv
+        local stop
+        if rv > 0 then stop = rv * rv / (2 * aRel) else stop = -rv * rv / (2 * aHold) end
+        stop = clamp(stop, -len * 0.6, len * 0.6)
+        local e = tgt - (bP + stop)               -- >0: bar will stop short of the target -> hold
+
+        local band = math.max(1, bw * 0.03)
+        local want = holdNow
+        if e > band then want = true elseif e < -band then want = false end
+        -- sitting on a wall with the target beyond it: just keep pushing
+        if tgt >= hi - 0.5 and fP >= hi then want = true end
+        if tgt <= lo + 0.5 and fP <= lo then want = false end
+        if want ~= holdNow then
+            lastSwitch = now; stable = 0
+            hist[#hist + 1] = { now, want }
+            if #hist > 24 then table.remove(hist, 1) end
+        end
+        holdNow = want
+        if opts.mem then opts.mem.aHold, opts.mem.aRel, opts.mem.len = aHold, aRel, len end
+        return want, { zone = math.abs(f - b) <= bw / 2, bv = bv, fv = fv, aHold = aHold, aRel = aRel }
+    end
+    return B
+end
+
+-- what the brain learned about your bar, one entry per rod (rods differ in control);
+-- save() writes it to disk and it comes back here as nh / nr
+local function memFor(rod)
+    local k = (rod and rod.Name) or "?"
+    cal[k] = cal[k] or {}
+    return cal[k]
+end
+
+-- the minigame: keep the white bar under the fish icon until the GUI closes
+local function playReel(reel, bar, fish, rod)
+    local track = bar.Parent
+    local hx, hy = point()
+    local function mid(g) return g.AbsolutePosition.X + g.AbsoluteSize.X / 2 end
+
+    local cur, down, holdT, peak = nil, false, 0, 0
+    local function setHold(want)
+        local name = H.cur()
+        if down and (not want or name ~= cur) then
+            pcall(PRESS[cur], false, hx, hy)
+            down = false
+        end
+        if want and not down and up(reel) then
+            cur = name
+            if pcall(PRESS[name], true, hx, hy) then
+                down, holdT, peak = true, os.clock(), 0
+            else
+                H.bad()
+            end
+        end
+    end
+
+    if CFG.HUMAN and not CFG.PERFECT then pause(CFG.REEL_START) end
+    local mem = memFor(rod)
+    local brain = newBrain({ human = CFG.HUMAN and not CFG.PERFECT, mem = mem })
+    local t0 = os.clock()
+    local last, lastPaint, hit, all, fvTop = t0, t0, 0, 0, 0
+    local slipT = nil
+    local ok, err = pcall(function()
+        while alive() and up(reel) and os.clock() - t0 < CFG.REEL_TIMEOUT do   -- finishes even if paused mid-reel
+            if not (bar.Parent and fish.Parent) then break end
+            local now = os.clock()
+            local bw, fw = bar.AbsoluteSize.X, fish.AbsoluteSize.X
+            local f, b = mid(fish), mid(bar)
+            local L, R
+            if track and track.AbsoluteSize.X > 2 then
+                L = track.AbsolutePosition.X
+                R = L + track.AbsoluteSize.X
+            else
+                L, R = 0, viewport().X
+            end
+
+            local want, info = brain.step(now, f, b, bw, fw, L, R)
+            if math.abs(info.fv) > fvTop then fvTop = math.abs(info.fv) end
+            setHold(want)
+            if not info.zone and not slipT then
+                slipT = now - t0
+                log(string.format("SLIP at %.2fs | off %dpx | bar %dpx | fish v %d | bar v %d",
+                    slipT, px(f - b), px(bw), px(info.fv), px(info.bv)))
+            end
+
+            local dt = now - last
+            last = now
+            if dt > 0 and dt < 0.5 then
+                all = all + dt
+                if info.zone then hit = hit + dt end
+            end
+            if now - lastPaint > 0.25 and all > 0 then
+                curAcc, lastPaint = hit / all, now
+            end
+
+            -- is the hold doing anything? if the bar never speeds up to the right, switch input method
+            if down then
+                if info.bv > peak then peak = info.bv end
+                if now - holdT > 0.6 then
+                    local edge = b + bw / 2 >= R - 3
+                    if peak > math.max(40, (R - L) * 0.1) then H.ok() elseif not edge and not next(H.wins) then H.bad() end
+                    holdT, peak = now, 0
+                end
+            end
+            RunService.Heartbeat:Wait()
+        end
+    end)
+    setHold(false)
+    if all > 0.5 then
+        lastAcc = hit / all
+        accHit, accAll = accHit + hit, accAll + all
+        ST.reels, ST.reelSecs = ST.reels + 1, ST.reelSecs + all
+        mem.n = (tonumber(mem.n) or 0) + 1
+        log(string.format("reel done - accuracy %d%%", px(lastAcc * 100)))
+        if lastAcc < 0.85 then
+            log(string.format("low acc %d%% | fish top %d px/s | aHold %d aRel %d | track %d",
+                px(lastAcc * 100), px(fvTop), px(mem.aHold or 0), px(mem.aRel or 0), px(mem.len or 0)))
+        end
+        save()          -- keeps calibration and lifetime numbers current
+    end
+    curAcc = nil
+    if not ok then log("reel: " .. tostring(err)) end
+end
+
+---------------------------------------------------------------- self-repair
+
+local homeLook, pulse, rung = nil, os.clock(), 0
+
+---------------------------------------------------------------- report + notify
+-- Optional extras. They only read state; none of them can stop the fishing loop.
+
+-- a GUI's children as indented text, capped so a report stays pasteable
+local function treeText(inst, maxLines)
+    local out, n = {}, 0
+    local function walk(o, depth)
+        for _, c in ipairs(o:GetChildren()) do
+            if n >= maxLines then return end
+            n = n + 1
+            local extra = ""
+            if c:IsA("GuiObject") then
+                extra = string.format(" vis=%s %dx%d", tostring(c.Visible), px(c.AbsoluteSize.X), px(c.AbsoluteSize.Y))
+                if c:IsA("TextLabel") or c:IsA("TextButton") then
+                    extra = extra .. ' "' .. string.sub((c.Text:gsub("%s+", " ")), 1, 24) .. '"'
+                end
+            end
+            out[#out + 1] = string.rep("  ", depth) .. c.Name .. " [" .. c.ClassName .. "]" .. extra
+            walk(c, depth + 1)
+        end
+    end
+    walk(inst, 0)
+    if n >= maxLines then out[#out + 1] = "  ... (cut)" end
+    return table.concat(out, "\n")
+end
+
+local SNAP, snapOrder = {}, {}
+
+-- remember what a GUI looked like the first time it showed up (one entry per key)
+local function snapOnce(key, g)
+    if SNAP[key] or not g or #snapOrder >= 16 then return end
+    snapOrder[#snapOrder + 1] = key
+    local ok, txt = pcall(treeText, g, 60)
+    SNAP[key] = g.Name .. " [" .. g.ClassName .. "]\n" .. (ok and txt or ("snapshot failed: " .. tostring(txt)))
+end
+
+-- GUIs that appear while you play (cast bar, shake, reel, popups) are saved for the report
+local pgSeen = {}
+for _, c in ipairs(pg:GetChildren()) do pgSeen[c.Name] = true end
+recorder = pg.ChildAdded:Connect(function(c)
+    if not c:IsA("ScreenGui") or pgSeen[c.Name] then return end
+    pgSeen[c.Name] = true
+    task.delay(0.4, function()     -- give it a moment to fill with children
+        if alive() and c.Parent then pcall(snapOnce, "new " .. c.Name, c) end
+    end)
+end)
+
+local function pct(a) return a and string.format("%d%%", px(a * 100)) or "-" end
+
+local function span(t)
+    if type(t) == "table" then return string.format("%.2f-%.2f", t[1], t[2]) end
+    return tostring(t)
+end
+
+local function statusLine()
+    local el = os.clock() - sessionStart
+    return string.format("%s | caught %d | %s/h | accuracy %s | session %s",
+        (STAGES[stage] or STAGES.start)[1], count,
+        (count > 0 and el > 90) and tostring(px(count / (el / 3600))) or "-",
+        pct(accAll > 0 and accHit / accAll or nil), fmtTime(el))
+end
+
+local function buildReport()
+    local out = {}
+    local function add(fmt, ...) out[#out + 1] = string.format(fmt, ...) end
+    local v, el = viewport(), os.clock() - sessionStart
+    local okx, ex = pcall(function() return identifyexecutor() end)
+    add("AutoFish v6-9 report")
+    add("executor %s | touch %s | keyboard %s | screen %dx%d | place %s",
+        okx and tostring(ex) or "?", tostring(UIS.TouchEnabled), tostring(UIS.KeyboardEnabled),
+        px(v.X), px(v.Y), tostring(game.PlaceId))
+    add("stage %s | running %s | session %s | caught %d | accuracy %s | fails %d | repair step %d",
+        stage, tostring(running), fmtTime(el), count, pct(accAll > 0 and accHit / accAll or nil), fails, rung)
+    add("lifetime %d catches | %s running | %d executes", LIFE.catches, fmtTime(LIFE.secs), LIFE.runs)
+    add("input methods: cast=%s shake=%s hold=%s | bobber check %s",
+        C.cur(), S.cur(), H.cur(), useBobber and "on" or "off")
+    add("names: shake=%s button=%s reel=%s bar=%s fish=%s rod=%s",
+        CFG.GUI_SHAKE, CFG.SHAKE_BUTTON, CFG.GUI_REEL, CFG.BAR_NAME, CFG.FISH_NAME, tostring(CFG.ROD_NAME or "auto"))
+    add("settings: HUMAN=%s GUARD=%s WALK_HOME=%s DEBUG=%s",
+        tostring(CFG.HUMAN), tostring(CFG.GUARD), tostring(CFG.WALK_HOME), tostring(CFG.DEBUG))
+    add("timing: CAST_HOLD=%s COOLDOWN=%s TIMEOUT=%s REEL_TIMEOUT=%s",
+        span(CFG.CAST_HOLD), span(CFG.COOLDOWN), tostring(CFG.TIMEOUT), tostring(CFG.REEL_TIMEOUT))
+    add("casts %d (misses %d) | shake presses %d ok, %d no effect | got away %d | errors %d",
+        ST.casts, ST.castMiss, ST.shakeHit, ST.shakeMiss, ST.away, ST.errors)
+    add("self-repairs %d | last fish %ds ago", ST.fixes, px(os.clock() - ST.lastFish))
+    add("reels %d%s | bite wait %s", ST.reels,
+        ST.reels > 0 and string.format(" (avg %.0fs)", ST.reelSecs / ST.reels) or "",
+        ST.waitN > 0 and string.format("avg %.1fs over %d", ST.waitSum / ST.waitN, ST.waitN) or "-")
+    add("ping now %s | avg %dms | max %dms", pingText(),
+        PING.n > 0 and math.floor(PING.sum / PING.n + 0.5) or 0, math.floor(PING.max + 0.5))
+    if ST.lastErr ~= "" then add("last error: %s", ST.lastErr) end
+    for k, m in pairs(cal) do
+        local h = (m.aHold and m.len and m.len > 50) and m.aHold / m.len or m.nh
+        local r = (m.aRel and m.len and m.len > 50) and m.aRel / m.len or m.nr
+        if h and r then
+            add("calibration %s: hold %.2f release %.2f (x track), %d reels", k, h, r, math.floor(tonumber(m.n) or 0))
+        end
+    end
+    local gl = {}
+    for _, c in ipairs(pg:GetChildren()) do
+        gl[#gl + 1] = c.Name .. (c:IsA("ScreenGui") and (c.Enabled and "" or "(off)") or ("[" .. c.ClassName .. "]"))
+    end
+    out[#out + 1] = "PlayerGui: " .. table.concat(gl, ", ")
+    for _, k in ipairs(snapOrder) do
+        out[#out + 1] = "--- GUI " .. k .. " ---"
+        out[#out + 1] = SNAP[k]
+    end
+    out[#out + 1] = "--- last log lines ---"
+    for _, s in ipairs(logbuf) do out[#out + 1] = s end
+    return table.concat(out, "\n")
+end
+
+copyReport = function()
+    local okb, text = pcall(buildReport)
+    if not okb then text = "report failed: " .. tostring(text) .. "\n" .. table.concat(logbuf, "\n") end
+    local set = setclipboard or toclipboard or set_clipboard
+    if type(set) == "function" and pcall(set, text) then return "clipboard" end
+    print(text)          -- no clipboard on this executor: the report is in the console now
+    return "console"
+end
+
+---------------------------------------------------------------- webhook v2: Discord embeds (replaces the old notify + webhook block)
+-- system / script lines are not sent any more. The watchdog and NOTIFY_EVERY still call this, so it stays (does nothing)
+local function notify() end
+
+---------------------------------------------------------------- webhook: events + catch report (Discord embeds)
+-- Only reads state and posts to the webhook. Nothing in here can stop the fishing loop.
+
+HK.seen = setmetatable({}, { __mode = "k" })
+HK.hosts = { "https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/",
+             "https://ptb.discord.com/api/webhooks/", "https://canary.discord.com/api/webhooks/" }
+HK.newTools, HK.pop = {}, {}   -- what showed up around a catch (new Tools / short on-screen texts); used to find the fish name
+
+-- game announcements. The first match wins, so specific ones go first. Add / edit freely.
+-- { words to look for, icon, title, colour, optional pattern that pulls a better title out of the text }
+HK.kinds = {
+    { "totem",       "\u{1F5FF}",        "Totem",       0xA855F7, "(%a+%s+[Tt]otem)" },
+    { "blood moon",  "\u{1FA78}",        "Blood Moon",  0x9B1C1C },
+    { "blue moon",   "\u{1F319}",        "Blue Moon",   0x3B82F6 },
+    { "eclipse",     "\u{1F311}",        "Eclipse",     0x4B5563 },
+    { "aurora",      "\u{1F30C}",        "Aurora",      0x2DD4BF },
+    { "meteor",      "\u{2604}\u{FE0F}", "Meteor",      0xF97316 },
+    { "megalodon",   "\u{1F988}",        "Megalodon",   0xDC2626 },
+    { "shark hunt",  "\u{1F988}",        "Shark Hunt",  0xEF4444 },
+    { "kraken",      "\u{1F419}",        "Kraken",      0x8B5CF6 },
+    { "leviathan",   "\u{1F409}",        "Leviathan",   0x0EA5E9 },
+    { "whirlpool",   "\u{1F300}",        "Whirlpool",   0x06B6D4 },
+    { "firefl",      "\u{2728}",         "Fireflies",   0xFACC15 },
+    { "luminous",    "\u{1F4A1}",        "Luminous",    0xFDE047 },
+    { "abundance",   "\u{1F41F}",        "Abundance",   0x22C55E },
+    { "surge",       "\u{26A1}",         "Surge",       0xEAB308 },
+    { "apex",        "\u{1F451}",        "Apex",        0xF59E0B },
+    { "hunt",        "\u{1F3AF}",        "Hunt",        0xF43F5E, "(%a+%s+[Hh]unt)" },
+    -- anything else the game announces
+    { "event",       "\u{1F4E2}",        "Event",       0x5865F2 },
+    { "spawned",     "\u{1F4E2}",        "Spawned",     0x5865F2 },
+    { "has begun",   "\u{1F4E2}",        "Event",       0x5865F2 },
+    { "has started", "\u{1F4E2}",        "Event",       0x5865F2 },
+}
+
+-- words that are never a fish name (rarity tags, buttons ...)
+HK.skip = { common = 1, uncommon = 1, unusual = 1, rare = 1, legendary = 1, mythical = 1, exotic = 1, secret = 1,
+            relic = 1, fragment = 1, gemstone = 1, limited = 1, apex = 1, special = 1, trash = 1, new = 1,
+            caught = 1, weight = 1, kg = 1, close = 1, sell = 1, ok = 1 }
+
+function HK.okUrl(u)
+    if type(u) ~= "string" then return false end
+    for _, h in ipairs(HK.hosts) do
+        if u:sub(1, #h) == h and #u > #h + 8 then return true end
+    end
+    return false
+end
+
+function HK.save()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        writefile("autofish_hook.json", HttpService:JSONEncode({
+            hook = CFG.NOTIFY_URL or "", fish = CFG.NOTIFY_FISH, events = CFG.NOTIFY_EVENTS,
+        }))
+    end)
+end
+
+-- one POST; returns ok, code-or-reason. Discord's 429 sets HK.cool so the queue backs off
+function HK.post(data)
+    local url = CFG.NOTIFY_URL
+    local req = request or http_request or (syn and syn.request) or (http and http.request)
+    if not HK.okUrl(url) then return false, "no webhook url" end
+    if type(req) ~= "function" then return false, "executor has no request()" end
+    data.allowed_mentions = { parse = {} }
+    local ok, res = pcall(function()
+        return req({
+            Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(data),
+        })
+    end)
+    if not ok then return false, (tostring(res):gsub("https?://%S+", "<url>")) end
+    local code = type(res) == "table" and tonumber(res.StatusCode or res.status_code) or nil
+    if code == 429 then
+        local okj, j = pcall(function() return HttpService:JSONDecode(res.Body) end)
+        HK.cool = os.clock() + math.min(30, (okj and type(j) == "table" and tonumber(j.retry_after)) or 5) + 0.5
+    end
+    return code == nil or (code >= 200 and code < 300), code or "ok"
+end
+
+-- embeds go out together (max 10 per message); a rate-limit puts them back in the queue
+function HK.send(embeds)
+    local ok, why = HK.post({ embeds = embeds })
+    if not ok then
+        if why == 429 then
+            for i = #embeds, 1, -1 do table.insert(HK.q, 1, embeds[i]) end
+        elseif os.clock() - (HK.errAt or -99) > 60 then
+            HK.errAt = os.clock()
+            log("webhook: send failed - " .. tostring(why))
+        end
+    end
+    return ok, why
+end
+
+function HK.now() return os.date("!%Y-%m-%dT%H:%M:%SZ") end
+
+-- the same few numbers under every embed
+function HK.stats()
+    local el = os.clock() - sessionStart
+    return {
+        { name = "Status",   value = (STAGES[stage] or STAGES.start)[1], inline = true },
+        { name = "Total",    value = tostring(count), inline = true },
+        { name = "Rate",     value = (count > 0 and el > 90) and (px(count / (el / 3600)) .. "/h") or "-", inline = true },
+        { name = "Accuracy", value = pct(accAll > 0 and accHit / accAll or nil), inline = true },
+        { name = "Session",  value = fmtTime(el), inline = true },
+    }
+end
+
+function HK.test()
+    local ok, why = HK.send({ {
+        title = "\u{2705}  Webhook connected",
+        description = "Game events and catch reports will show up here.",
+        color = 0x57F287,
+        fields = HK.stats(),
+        footer = { text = "AutoFish" },
+        timestamp = HK.now(),
+    } })
+    log("webhook test: " .. (ok and "sent" or ("failed - " .. tostring(why))))
+end
+
+-- the URL box lost focus: save it, clear it ("off"), or reject it
+function HK.typed(s)
+    s = tostring(s or ""):gsub("%s+", "")
+    local box = ui and ui.hookBox
+    local function show()
+        local u = CFG.NOTIFY_URL or ""
+        if box then box.Text = (u ~= "") and ("webhook saved  ..." .. u:sub(-6)) or "" end
+        if ui and ui.hookLook then ui.hookLook() end
+    end
+    if s == "" then show() return end
+    if s:lower() == "off" then
+        CFG.NOTIFY_URL = ""
+        HK.save()
+        show()
+        log("webhook removed")
+    elseif HK.okUrl(s) then
+        CFG.NOTIFY_URL = s
+        HK.save()
+        show()
+        task.spawn(function() pcall(HK.test) end)
+    else
+        if box then box.Text, box.PlaceholderText = "", "not a Discord webhook URL" end
+        log("webhook: that is not a discord webhook url")
+    end
+end
+
+---------------------------------------------------------------- text helpers
+
+-- no rich-text tags, one space between words
+function HK.plain(s)
+    s = tostring(s or ""):gsub("<[^>]+>", ""):gsub("%s+", " ")
+    return (s:match("^%s*(.-)%s*$"))
+end
+
+-- "5.2 kg" / "1,234.5kg" -> number
+function HK.kgOf(s)
+    local n = tostring(s):match("([%d%.,]*%d)%s*[kK][gG]")
+    return n and tonumber((n:gsub(",", ""))) or nil
+end
+
+-- "Salmon (5.2kg)" -> 5.2, "Salmon"      "5.2 kg" -> 5.2, ""      "Weight: 5.2 kg" -> 5.2, ""
+function HK.split(s)
+    s = HK.plain(s)
+    local kg = HK.kgOf(s)
+    if not kg then return nil end
+    local rest = s:gsub("[%d%.,]*%d%s*[kK][gG]", ""):gsub("[%(%)%[%]:|%-]", " "):gsub("%s+", " ")
+    rest = rest:match("^%s*(.-)%s*$")
+    if rest:lower() == "weight" or rest:lower() == "wt" then rest = "" end
+    return kg, rest
+end
+
+-- a usable fish name or nil
+function HK.cleanName(s)
+    s = HK.plain(s)
+    s = s:gsub("%s*[%[%(][^%]%)]*%d[^%]%)]*[%]%)]%s*$", "")   -- drop a trailing "(5.2kg)" / "[12 kg]"
+    s = s:gsub("[!%.]+$", ""):sub(1, 40)
+    if #s < 2 or not s:find("%a") then return nil end
+    return s
+end
+
+function HK.kind(s)
+    s = tostring(s):lower()
+    for _, k in ipairs(HK.kinds) do
+        if s:find(k[1], 1, true) then return k end
+    end
+end
+
+---------------------------------------------------------------- live events: one embed per announcement
+
+function HK.event(text, gap)
+    if not (CFG.NOTIFY_EVENTS and HK.okUrl(CFG.NOTIFY_URL)) then return end
+    text = HK.plain(text):sub(1, 220)
+    if #text < 4 or text:find("^AutoFish") then return end
+    local k = HK.kind(text)
+    if not k then return end            -- not an in-game event (script lines, world values ...): not sent
+    local low = text:lower()
+    local status
+    if low:find("ended", 1, true) or low:find("finished", 1, true) or low:find("despawn", 1, true)
+        or low:find(" over", 1, true) then
+        status = "ended"
+    elseif low:find("start", 1, true) or low:find("begun", 1, true) or low:find("begin", 1, true)
+        or low:find("spawn", 1, true) or low:find("appear", 1, true) then
+        status = "started"
+    end
+    -- a bare label ("Apex Trout", "Event Shop", "Event: 12:34") is not an announcement: it needs a start / end word
+    -- or at least 3 words, and the catch-all kinds need the start / end word
+    local generic = (k[3] == "Event" or k[3] == "Spawned")
+    local words = select(2, text:gsub("%S+", ""))
+    if not status and (generic or words < 3) then return end
+    local title = k[5] and text:match(k[5]) or k[3]
+    -- the same text (digits ignored) once per `gap` seconds; the same title + status once per 45s (popup and chat say it twice)
+    local now = os.clock()
+    local tkey = "t:" .. (low:gsub("%d+", "#"))
+    local kkey = generic and tkey or ("k:" .. title .. (status or ""))
+    if (HK.keys[tkey] and now - HK.keys[tkey] < (gap or 600)) or (HK.keys[kkey] and now - HK.keys[kkey] < 45) then return end
+    HK.keys[tkey], HK.keys[kkey] = now, now
+    local body = "> " .. text
+    if status then
+        body = (status == "started" and "\u{1F7E2} **Started**" or "\u{1F534} **Ended**") .. "\n" .. body
+    end
+    HK.q[#HK.q + 1] = {
+        title = k[2] .. "  " .. title,
+        description = body,
+        color = (status == "ended") and 0x6B7280 or k[4],
+        footer = { text = "AutoFish" },
+        timestamp = HK.now(),
+    }
+    if #HK.q > 20 then table.remove(HK.q, 1) end
+end
+
+-- script log lines are not sent (kept as a stub: the log wrapper below still calls it)
+function HK.onLog() end
+
+---------------------------------------------------------------- finding the fish name
+
+function HK.fish(name, kg, how)
+    HK.tally[name] = (HK.tally[name] or 0) + 1
+    if kg and kg > (HK.best and HK.best.kg or 0) then HK.best = { name = name, kg = kg } end
+    log("fish: " .. name .. (kg and string.format(" %.1fkg", kg) or "") .. " [" .. how .. "]")
+end
+
+-- Tools that show up (a caught fish can arrive as a Tool); the rod is ignored
+function HK.watchTools()
+    local function onAdd(o)
+        if not alive() or not o:IsA("Tool") or HK.seen[o] then return end
+        HK.seen[o] = true
+        if isRod(o) then return end
+        HK.newTools[#HK.newTools + 1] = { t = os.clock(), name = o.Name }
+        if #HK.newTools > 20 then table.remove(HK.newTools, 1) end
+    end
+    local function hook(c)
+        for _, o in ipairs(c:GetChildren()) do HK.seen[o] = true end
+        HK.conns[#HK.conns + 1] = c.ChildAdded:Connect(onAdd)
+    end
+    local bp = lp:FindFirstChildOfClass("Backpack")
+    if bp then hook(bp) end
+    if lp.Character then hook(lp.Character) end
+    HK.conns[#HK.conns + 1] = lp.CharacterAdded:Connect(hook)
+    HK.conns[#HK.conns + 1] = lp.ChildAdded:Connect(function(c) if c:IsA("Backpack") then hook(c) end end)
+end
+
+-- short texts that appear while a reel is on / just finished (the catch popup); one entry per label
+function HK.keep(d, s)
+    local now = os.clock()
+    for _, e in ipairs(HK.pop) do
+        if e.d == d then e.s, e.t, e.used = s, now, nil return end
+    end
+    HK.pop[#HK.pop + 1] = { d = d, s = s, t = now }
+    if #HK.pop > 60 then table.remove(HK.pop, 1) end
+end
+
+-- the fish a finished reel gave you -> name, kg, where it was read from (or nothing yet)
+function HK.resolve(since)
+    -- 1) a Tool that appeared
+    for i = #HK.newTools, 1, -1 do
+        local e = HK.newTools[i]
+        if e.t >= since and not e.used then
+            e.used = true
+            local n = HK.cleanName(e.name)
+            if n then return n, HK.kgOf(e.name), "tool" end
+        end
+    end
+    -- 2) the catch popup: labels that are on screen now and showed up during / after the reel
+    local live = {}
+    for _, e in ipairs(HK.pop) do
+        if e.t >= since and not e.used and e.d.Parent and e.d.Text == e.s and shown(e.d) then live[#live + 1] = e end
+    end
+    for _, e in ipairs(live) do          -- "You caught a Salmon" / "Caught: Salmon (5.2kg)"
+        local s = HK.plain(e.s)
+        local n = s:match("[Cc]aught%s+an?%s+(.+)") or s:match("[Cc]aught:?%s+(.+)")
+        n = n and HK.cleanName(n)
+        if n and not HK.skip[n:lower()] then e.used = true return n, HK.kgOf(s), "popup" end
+    end
+    for _, w in ipairs(live) do          -- "Salmon (5.2kg)" in one label, or a weight label with the name next to it
+        local kg, rest = HK.split(w.s)
+        if kg then
+            local n = rest ~= "" and HK.cleanName(rest)
+            if n and not HK.skip[n:lower()] then w.used = true return n, kg, "popup" end
+            local a = w.d.Parent
+            for _ = 1, 3 do              -- the biggest text near the weight (name > rarity tag), small containers only
+                if not a or a:IsA("ScreenGui") then break end
+                local ds = a:GetDescendants()
+                if #ds > 30 then break end
+                local best, bh = nil, 0
+                for _, c in ipairs(ds) do
+                    if c ~= w.d and c:IsA("TextLabel") and shown(c) then
+                        local nm = HK.cleanName(c.Text)
+                        if nm and #nm <= 30 and not HK.skip[nm:lower()] and not nm:find("^[%d%.,%s]")
+                            and c.AbsoluteSize.Y > bh then
+                            best, bh = nm, c.AbsoluteSize.Y
+                        end
+                    end
+                end
+                if best then w.used = true return best, kg, "weight label" end
+                a = a.Parent
+            end
+        end
+    end
+end
+
+-- runs ~6s after every counted catch. Nothing found: one log line with what was on screen (Copy report shows it)
+function HK.lookup()
+    local since = os.clock() - 8
+    for _ = 1, 16 do
+        local name, kg, how = HK.resolve(since)
+        if name then HK.fish(name, kg, how) return end
+        task.wait(0.4)
+    end
+    local seen = {}
+    for _, e in ipairs(HK.pop) do
+        if e.t >= since then seen[#seen + 1] = e.s:sub(1, 20) end
+    end
+    log("fish name not found | tools seen " .. #HK.newTools .. " | texts: " .. table.concat(seen, " | "):sub(1, 220))
+end
+
+---------------------------------------------------------------- watchers
+
+-- the game's popups ("Shark Hunt has started" ...): a TextLabel that appears or changes text while it is visible
+function HK.watchText()
+    local function look(d)
+        if not alive() then return end
+        local s = d.Text
+        if type(s) ~= "string" or s == "" or #s > 160 then return end
+        if gui and d:IsDescendantOf(gui) then return end                     -- the AutoFish panel's own text
+        if CFG.NOTIFY_FISH and #s <= 60 and os.clock() < HK.winUntil then HK.keep(d, s) end   -- fish name hunt
+        if #s < 8 then return end
+        if CFG.DEBUG and shown(d) then            -- Debug on: every new text is logged as "txt:" (see Copy report)
+            local k = s:lower():gsub("%d+", "#")
+            if not HK.txt[k] then HK.txt[k] = true; log("txt: " .. s:sub(1, 70)) end
+        end
+        if not (CFG.NOTIFY_EVENTS and HK.kind(s)) then return end
+        task.delay(0.4, function()                -- the text is often set just before the popup is switched on
+            if alive() and d.Parent and shown(d) then HK.event(s) end
+        end)
+    end
+    local function hook(d)
+        if d:IsA("TextLabel") then
+            look(d)
+            d:GetPropertyChangedSignal("Text"):Connect(function() look(d) end)
+        end
+    end
+    task.spawn(function()                         -- labels that already exist: only a later change counts
+        local n = 0
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d:IsA("TextLabel") then d:GetPropertyChangedSignal("Text"):Connect(function() look(d) end) end
+            n = n + 1
+            if n % 400 == 0 then task.wait() end
+        end
+    end)
+    HK.conns[#HK.conns + 1] = pg.DescendantAdded:Connect(hook)
+end
+
+-- server messages in the chat box (system messages have no TextSource)
+function HK.watchChat()
+    local tcs = game:GetService("TextChatService")
+    HK.conns[#HK.conns + 1] = tcs.MessageReceived:Connect(function(m)
+        if alive() and m.TextSource == nil then HK.event(m.Text) end
+    end)
+end
+
+-- world values (weather, day / night ...) are not sent any more; kept so the starter line below still works
+function HK.watchWorld() end
+
+---------------------------------------------------------------- catch report (every CFG.FISH_EVERY minutes)
+
+function HK.fishEmbed(mins)
+    local rows, named = {}, 0
+    for name, n in pairs(HK.tally) do rows[#rows + 1] = { name, n }; named = named + n end
+    table.sort(rows, function(a, b) if a[2] ~= b[2] then return a[2] > b[2] end return a[1] < b[1] end)
+    local total = math.max(HK.n5, named)
+    local lost = ST.away - HK.away5
+    local span = string.format("%g", mins)
+    local lines = {}
+    for i, r in ipairs(rows) do
+        if i > 20 then lines[#lines + 1] = "*+" .. (#rows - 20) .. " more kinds*"; break end
+        lines[#lines + 1] = string.format("`x%-2d` %s", r[2], r[1])
+    end
+    if total > named then lines[#lines + 1] = string.format("`x%-2d` *name not read*", total - named) end
+    local fields = HK.stats()
+    if lost > 0 then table.insert(fields, 1, { name = "Got away", value = tostring(lost), inline = true }) end
+    if HK.best then
+        table.insert(fields, 1, { name = "Biggest", value = string.format("%s - %.1f kg", HK.best.name, HK.best.kg), inline = true })
+    end
+    return {
+        title = total > 0 and ("\u{1F3A3}  " .. total .. " caught in " .. span .. " min")
+                           or ("\u{26A0}\u{FE0F}  No catches in " .. span .. " min"),
+        description = #lines > 0 and table.concat(lines, "\n") or "Nothing landed this round.",
+        color = total > 0 and 0x2ECC71 or 0xE67E22,
+        fields = fields,
+        footer = { text = "AutoFish" },
+        timestamp = HK.now(),
+    }
+end
+
+---------------------------------------------------------------- senders
+
+-- a counted catch (HK.n5 goes up) starts a short hunt for its name
+task.spawn(function()
+    local last = HK.n5
+    while alive() do
+        task.wait(0.3)
+        local cur = HK.n5
+        if cur ~= last then
+            if cur > last and CFG.NOTIFY_FISH then task.spawn(function() pcall(HK.lookup) end) end
+            last = cur
+        end
+    end
+end)
+
+-- queued events go out every ~2s (up to 5 embeds per message); the catch report every CFG.FISH_EVERY minutes
+HK.nextFish = os.clock() + CFG.FISH_EVERY * 60
+task.spawn(function()
+    while alive() do
+        task.wait(2)
+        pcall(function()
+            local now = os.clock()
+            for k, t in pairs(HK.keys) do if now - t > 600 then HK.keys[k] = nil end end
+            local ready = HK.okUrl(CFG.NOTIFY_URL)
+            if not (CFG.NOTIFY_EVENTS and ready) then
+                HK.q = {}
+            elseif #HK.q > 0 and now >= (HK.cool or 0) then
+                local list = {}
+                while #HK.q > 0 and #list < 5 do list[#list + 1] = table.remove(HK.q, 1) end
+                HK.send(list)
+            end
+            local per = (tonumber(CFG.FISH_EVERY) or 5) * 60
+            if not running then
+                HK.nextFish = now + per                      -- paused: the clock waits
+            elseif now >= HK.nextFish and now >= (HK.cool or 0) then
+                HK.nextFish = now + per
+                if CFG.NOTIFY_FISH and ready then HK.send({ HK.fishEmbed(per / 60) }) end
+                HK.tally, HK.n5, HK.away5, HK.best = {}, 0, ST.away, nil
+            end
+        end)
+    end
+end)
+do  -- every log line goes past HK.onLog; stopping the script also drops the watchers
+    local baseLog, baseStop = log, env.__autofish_stop
+    log = function(...)
+        baseLog(...)
+        pcall(HK.onLog, note)
+    end
+    env.__autofish_stop = function()
+        for _, c in ipairs(HK.conns) do pcall(function() c:Disconnect() end) end
+        if baseStop then baseStop() end
+    end
+end
+
+for _, f in ipairs({ HK.watchTools, HK.watchText, HK.watchChat, HK.watchWorld }) do task.spawn(pcall, f) end
+
+local function releaseAll()
+    local x, y = point()
+    for _, m in ipairs({ "mouse", "mouse2", "touch", "space" }) do
+        pcall(PRESS[m], false, x, y)
+    end
+end
+
+-- walk back to the spot, ending up facing the way you started; true if it got there
+local function goHome(hum, root)
+    if not (home and hum and root) then return false end
+    stage = "walk"
+    log("walking back to the spot")
+    local function walk(to, tol, secs)
+        local t0 = os.clock()
+        while alive() and running and os.clock() - t0 < secs do
+            if (root.Position - to).Magnitude <= tol then return true end
+            hum:MoveTo(to)
+            task.wait(0.3)
+        end
+        return (root.Position - to).Magnitude <= tol
+    end
+    local look = homeLook and Vector3.new(homeLook.X, 0, homeLook.Z) or Vector3.zero
+    if look.Magnitude > 0.1 and not walk(home - look.Unit * 6, 4, 40) then return false end
+    return walk(home, 2.5, 10)
+end
+
+-- one repair step per call, each step stronger; true only when it gives up for good
+local function recover(why)
+    rung = rung + 1
+    ST.fixes = ST.fixes + 1
+    stage = "fix"
+    log(string.format("%s - repair step %d", why, rung))
+    releaseAll()
+    if rung >= 2 then
+        for _, c in ipairs({ C, S, H }) do c.i, c.wins, c.fails = 1, {}, {} end
+        useBobber = true
+    end
+    local rod, hum = getRod()
+    if rod and hum then
+        pcall(function()
+            hum:UnequipTools()
+            task.wait(0.6)
+            hum:EquipTool(rod)
+            task.wait(0.6)
+        end)
+        if rung >= 3 and home then
+            local c = lp.Character
+            local r = c and c:FindFirstChild("HumanoidRootPart")
+            if r and (r.Position - home).Magnitude > 4 then goHome(hum, r) end
+        end
+    end
+    if rung >= 4 then
+        local t = 6 + math.random() * 4   -- a short breather so a stuck spot can't spin the repairs flat out
+        log(string.format("still stuck - trying again in %ds", math.floor(t)))
+        local t0 = os.clock()
+        while alive() and running and os.clock() - t0 < t do task.wait(0.5) end
+        rung = 0
+        return false
+    end
+    return false
+end
+
+-- one miss; after CFG.MAX_FAILS in a row it runs a repair step (it never gives up)
+local function failed(why)
+    fails = fails + 1
+    if fails >= CFG.MAX_FAILS then
+        fails = 0
+        return recover(why)
+    end
+    if fails >= 3 then
+        local t = 2 + math.random() * 3
+        log(string.format("%s - waiting %ds", why, math.floor(t)))
+        local t0 = os.clock()
+        while alive() and running and os.clock() - t0 < t do task.wait(0.5) end
+    end
+    return false
+end
+
+local function cycle()
+    local rod, hum = getRod()
+    if not rod then
+        log("no rod in your hands or backpack - equip one and I'll carry on")
+        task.wait(3)
+        return
+    end
+
+    if CFG.GUARD then
+        local c = lp.Character
+        local r = c and c:FindFirstChild("HumanoidRootPart")
+        if r then
+            if not home then
+                home, homeLook = r.Position, r.CFrame.LookVector
+            elseif (r.Position - home).Magnitude > CFG.GUARD_STUDS then
+                local far = math.floor((r.Position - home).Magnitude)
+                if CFG.WALK_HOME and goHome(hum, r) then
+                    log("back on the spot")
+                else
+                    -- can't get back: fish from where we stand instead of repairing in a loop
+                    log("moved " .. far .. " studs and can't walk back - fishing from here")
+                    home, homeLook = r.Position, r.CFrame.LookVector
+                end
+            end
+        end
+    end
+
+    mood = clamp(mood + (math.random() - 0.5) * 0.14, 0.85, 1.25)
+
+    -- the bobber check was switched off after a slow catch: turn it back on as soon as the bobber is gone
+    if not useBobber and not reelReady() and not getShake() and not rod:FindFirstChild("bobber") then
+        useBobber = true
+        log("bobber check back on - the bobber is gone")
+    end
+
+    if not (reelReady() or getShake()) then
+        if lineOut(rod) then pause({ 1.0, 1.6 }) end   -- may still be reeling in the last catch
+        if not lineOut(rod) then                        -- (a line already out = script started mid-cast)
+            stage = "cast"
+            if not castLine(rod) then
+                if alive() and running then
+                    log("the cast never registers - face the water and check the rod")
+                    failed("cast failed")
+                end
+                task.wait(3)
+                return
+            end
+        end
+    end
+
+    stage = "wait"
+    local t0, done, warned, shaken, bitten = os.clock(), false, false, false, false
+    local idleAt = nil
+    while alive() and running and os.clock() - t0 < CFG.TIMEOUT do
+        local reel, bar, fish = getReel()
+        if reel and bar and fish then
+            if not bitten then
+                bitten = true
+                ST.waitSum, ST.waitN = ST.waitSum + (os.clock() - t0), ST.waitN + 1
+            end
+            pcall(snapOnce, "reel", reel)
+            stage = "reel"
+            log("reel minigame")
+            local a0, h0 = accAll, accHit
+            HK.winUntil = os.clock() + CFG.REEL_TIMEOUT + 10
+            playReel(reel, bar, fish, rod)
+            if CFG.PERFECT then
+                for _ = 1, 6 do
+                    if not (alive() and running) then break end
+                    task.wait()
+                    local g2, b2, f2 = getReel()
+                    if not (g2 and b2 and f2) then break end
+                    playReel(g2, b2, f2, rod)
+                end
+            end
+            local acc = (accAll > a0) and (accHit - h0) / (accAll - a0) or nil
+            HK.winUntil = os.clock() + 12
+            pulse = os.clock()
+            if acc == nil or acc >= CFG.CATCH_MIN_ACC then
+                count, rung = count + 1, 0
+                ST.lastFish = os.clock()
+                LIFE.catches = LIFE.catches + 1
+                HK.n5 = HK.n5 + 1
+            else
+                ST.away = ST.away + 1
+                log(string.format("fish got away (%d%%) - not counted", px(acc * 100)))
+            end
+            done = true
+            local t1 = os.clock()
+            while up(reel) and os.clock() - t1 < 8 do task.wait(0.2) end
+            break
+        else
+            if reel and not warned then
+                warned = true
+                log("reel GUI is up but '" .. CFG.BAR_NAME .. "' / '" .. CFG.FISH_NAME .. "' not found, GUI tree below")
+                tree(reel, 0, { 40 })
+            end
+            local shake = getShake()
+            if shake then
+                stage = "shake"
+                if not shaken then
+                    shaken = true
+                    if not bitten then
+                        bitten = true
+                        ST.waitSum, ST.waitN = ST.waitSum + (os.clock() - t0), ST.waitN + 1
+                    end
+                    t0 = os.clock()
+                    pcall(snapOnce, "shake", shake)
+                    pause(CFG.SHAKE_FIRST)   -- nobody presses the instant it shows up
+                    lapse(1.2)
+                end
+                shakeOnce(shake)
+                if CFG.PERFECT then
+                    local tg = os.clock() + human(CFG.SHAKE_GAP)
+                    repeat task.wait() until os.clock() >= tg or reelReady()
+                else
+                    pause(CFG.SHAKE_GAP)
+                end
+            else
+                local away = CFG.RECOVER ~= false and (rod.Parent ~= lp.Character
+                    or (useBobber and not lineOut(rod)))
+                if away then
+                    idleAt = idleAt or os.clock()
+                    if os.clock() - idleAt > 10 then
+                        log("idle 10s - re-equip and recast")
+                        ST.fixes = ST.fixes + 1
+                        pcall(function() hum:EquipTool(rod) end)
+                        task.wait(0.8)
+                        return
+                    end
+                else
+                    idleAt = nil
+                end
+                task.wait(CFG.PERFECT and 0.01 or 0.1)
+            end
+        end
+    end
+
+    if alive() and running then
+        if done then
+            fails = 0
+        else
+            log("nothing after " .. CFG.TIMEOUT .. "s - pulling the line back (ping " .. pingText() .. ")")
+            pcall(function()
+                hum:UnequipTools()
+                task.wait(0.5)
+                hum:EquipTool(rod)
+                task.wait(0.5)
+            end)
+            if failed("no bite") then return end
+        end
+    end
+
+    stage = "cooldown"
+    pause(CFG.COOLDOWN)
+    if done then   -- a catch just ended, so the line is in: a bobber that stays is a stale one
+        local t2 = os.clock()
+        while lineOut(rod) and os.clock() - t2 < 5 do task.wait(0.2) end
+        if lineOut(rod) then
+            -- in the logs a bobber that stayed meant casts did nothing for 20-50s until the rod was re-equipped
+            log("bobber stays after a catch - re-equipping the rod")
+            pcall(function()
+                hum:UnequipTools()
+                task.wait(0.5)
+                hum:EquipTool(rod)
+                task.wait(0.8)
+            end)
+            if lineOut(rod) then
+                useBobber = false
+                log("bobber stays after a catch - ignoring the bobber check until a cast proves it again")
+            end
+        end
+    end
+end
+
+---------------------------------------------------------------- go
+
+task.spawn(function()
+    local last, lastSave = os.clock(), os.clock()
+    while alive() do
+        paint()
+        local now = os.clock()
+        if now - PING.at > 2 then
+            PING.at = now
+            samplePing()
+        end
+        if running then LIFE.secs = LIFE.secs + (now - last) end
+        last = now
+        if now - lastSave > 60 then
+            lastSave = now
+            save()
+        end
+        task.wait(0.25)
+    end
+end)
+
+local main
+local function startMain()
+    main = task.spawn(function()
+        while alive() do
+            if running then
+                local ok, err = pcall(cycle)
+                if not ok then
+                    log("error: " .. tostring(err))
+                    ST.errors, ST.lastErr = ST.errors + 1, tostring(err)
+                    task.wait(2)
+                end
+            else
+                task.wait(0.3)
+            end
+        end
+        if afk then afk:Disconnect() end
+        if dbg then dbg:Disconnect() end
+        if ui and ui.conn then ui.conn:Disconnect() end
+        if recorder then recorder:Disconnect() end
+    end)
+end
+startMain()
+
+-- watchdog: no finished reel for CFG.WATCHDOG seconds -> kill the loop, repair, restart it
+local nextPing = os.clock() + (tonumber(CFG.NOTIFY_EVERY) or 0) * 60
+task.spawn(function()
+    while alive() do
+        task.wait(2)
+        if running and (tonumber(CFG.NOTIFY_EVERY) or 0) > 0 and os.clock() >= nextPing then
+            nextPing = os.clock() + CFG.NOTIFY_EVERY * 60
+            pcall(function() notify(statusLine(), true) end)
+        end
+        local idle = (not running) or stage == "walk" or stage == "fix"
+        if idle or CFG.WATCHDOG <= 0 then
+            pulse = os.clock()
+        elseif os.clock() - pulse > CFG.WATCHDOG then
+            log("watchdog: nothing finished for " .. CFG.WATCHDOG .. "s")
+            notify("watchdog: nothing finished for " .. CFG.WATCHDOG .. "s - repairing", true)
+            if main then pcall(task.cancel, main) end
+            recover("watchdog")
+            pulse = os.clock()
+            if alive() then startMain() end
+        end
+    end
+end)
+
+log("v6-9 started - tap the panel button to pause")
